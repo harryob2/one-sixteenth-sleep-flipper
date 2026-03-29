@@ -5,10 +5,14 @@
 #include <gui/view_port.h>
 #include <infrared.h>
 #include <infrared_transmit.h>
+#include <infrared_worker.h>
 #include <input/input.h>
 #include <maxim_crc.h>
 #include <one_wire_host.h>
+#include <storage/storage.h>
+#include <toolbox/saved_struct.h>
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,12 +29,38 @@
 #define SENSOR_DISCOVERY_INTERVAL_MS 3000
 #define SENSOR_CONVERSION_WAIT_MS 800
 #define AUTO_ACTION_GAP_MS 15000
-#define OK_LONG_PRESS_MS 700
 
 #define IR_B10_ADDR 0x4C4D
 #define IR_B10_POWER_CMD 0x47B8
 #define IR_B10_FAN_SPEED_CMD 0x45BA
 #define IR_B10_FAN_CYCLE_CMD 0x16E9
+#define IR_HOLD_SEND_MS 1050
+#define IR_FILE_PATH "/ext/infrared/Remote.ir"
+#define IR_FILE_NAME_POWER "B10_power"
+#define IR_FILE_NAME_FAN_SPEED "Fan_speed"
+#define IR_FILE_NAME_FAN_CYCLE "Fan_cycle"
+
+#define INFRARED_SETTINGS_PATH INT_PATH(".infrared.settings")
+#define INFRARED_SETTINGS_VERSION (1)
+#define INFRARED_SETTINGS_MAGIC (0x1F)
+
+typedef enum {
+    IrActionNone = -1,
+    IrActionPower = 0,
+    IrActionFanSpeed,
+    IrActionFanCycle,
+} IrAction;
+
+typedef struct {
+    uint16_t address;
+    uint16_t command;
+    bool valid;
+} IrFileCode;
+
+typedef struct {
+    FuriHalInfraredTxPin tx_pin;
+    bool otg_enabled;
+} InfraredTxSettings;
 
 typedef struct {
     InputEvent input;
@@ -70,6 +100,19 @@ typedef struct {
 
     uint32_t last_ir_ms;
     char last_ir[24];
+    FuriHalInfraredTxPin ir_tx_pin;
+    InfraredWorker* ir_worker;
+    bool ir_tx_active;
+    uint32_t manual_ir_started_ms;
+    IrAction manual_ir_action;
+    bool suppress_ok_release_action;
+    bool suppress_left_short_action;
+    bool suppress_right_short_action;
+    IrFileCode ir_code_power;
+    IrFileCode ir_code_fan_speed;
+    IrFileCode ir_code_fan_cycle;
+    bool ir_file_ready;
+    bool ir_otg_enabled;
 
     bool power_on;
     uint8_t fan_speed;
@@ -78,10 +121,6 @@ typedef struct {
     bool auto_mode;
     float target_c;
     uint32_t last_auto_action_ms;
-
-    bool ok_pressed;
-    bool ok_long_sent;
-    uint32_t ok_pressed_ms;
 
     bool running;
 } OneSixteenthSleepApp;
@@ -118,33 +157,358 @@ static void app_set_last_ir(OneSixteenthSleepApp* app, const char* label) {
     app->last_ir_ms = now_ms();
 }
 
-static void app_send_ir(OneSixteenthSleepApp* app, uint16_t command, const char* label) {
-    furi_hal_infrared_set_tx_output(FuriHalInfraredTxPinInternal);
+static void trim_ascii(char* s) {
+    if(!s) return;
+    size_t len = strlen(s);
+    while(len > 0 && (s[len - 1] == '\r' || s[len - 1] == '\n' || s[len - 1] == ' ' || s[len - 1] == '\t')) {
+        s[--len] = '\0';
+    }
+    size_t start = 0;
+    while(s[start] == ' ' || s[start] == '\t') start++;
+    if(start > 0) memmove(s, s + start, len - start + 1);
+}
 
+static bool parse_ir_bytes_u16(const char* value, uint16_t* out_u16) {
+    unsigned int b0 = 0;
+    unsigned int b1 = 0;
+    unsigned int b2 = 0;
+    unsigned int b3 = 0;
+    if(sscanf(value, "%x %x %x %x", &b0, &b1, &b2, &b3) < 2) {
+        return false;
+    }
+    *out_u16 = (uint16_t)(((b0 & 0xFFu) << 8) | (b1 & 0xFFu));
+    return true;
+}
+
+static void maybe_store_ir_entry(
+    OneSixteenthSleepApp* app,
+    const char* name,
+    bool protocol_ok,
+    bool has_addr,
+    bool has_cmd,
+    uint16_t address,
+    uint16_t command) {
+    if(!name || !protocol_ok || !has_addr || !has_cmd) return;
+
+    IrFileCode code = {.address = address, .command = command, .valid = true};
+    if(strcmp(name, IR_FILE_NAME_POWER) == 0) {
+        app->ir_code_power = code;
+    } else if(strcmp(name, IR_FILE_NAME_FAN_SPEED) == 0) {
+        app->ir_code_fan_speed = code;
+    } else if(strcmp(name, IR_FILE_NAME_FAN_CYCLE) == 0) {
+        app->ir_code_fan_cycle = code;
+    }
+}
+
+static void app_load_ir_file_signals(OneSixteenthSleepApp* app) {
+    app->ir_file_ready = false;
+    app->ir_code_power.valid = false;
+    app->ir_code_fan_speed.valid = false;
+    app->ir_code_fan_cycle.valid = false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) {
+        FURI_LOG_W(TAG, "Storage unavailable; IR file fallback to constants");
+        return;
+    }
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        furi_record_close(RECORD_STORAGE);
+        FURI_LOG_W(TAG, "File alloc failed; IR file fallback");
+        return;
+    }
+
+    bool open_ok = storage_file_open(file, IR_FILE_PATH, FSAM_READ, FSOM_OPEN_EXISTING);
+    if(!open_ok) {
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+        FURI_LOG_W(TAG, "IR file missing: %s", IR_FILE_PATH);
+        return;
+    }
+
+    const uint64_t file_size = storage_file_size(file);
+    if(file_size == 0 || file_size > 8192) {
+        storage_file_close(file);
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+        FURI_LOG_W(TAG, "IR file invalid size: %lu", (unsigned long)file_size);
+        return;
+    }
+
+    char* text = malloc((size_t)file_size + 1u);
+    if(!text) {
+        storage_file_close(file);
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+        FURI_LOG_W(TAG, "IR file alloc failed");
+        return;
+    }
+
+    const uint16_t read_n = storage_file_read(file, text, (uint16_t)file_size);
+    text[read_n] = '\0';
+
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+
+    char current_name[32] = {0};
+    bool current_protocol_ok = false;
+    bool current_has_addr = false;
+    bool current_has_cmd = false;
+    uint16_t current_addr = 0;
+    uint16_t current_cmd = 0;
+
+    char* cursor = text;
+    while(*cursor) {
+        char* line = cursor;
+        char* nl = strchr(cursor, '\n');
+        if(nl) {
+            *nl = '\0';
+            cursor = nl + 1;
+        } else {
+            cursor += strlen(cursor);
+        }
+
+        trim_ascii(line);
+        if(line[0] == '\0' || line[0] == '#') continue;
+
+        if(strncmp(line, "name:", 5) == 0) {
+            maybe_store_ir_entry(
+                app,
+                current_name,
+                current_protocol_ok,
+                current_has_addr,
+                current_has_cmd,
+                current_addr,
+                current_cmd);
+
+            char* value = line + 5;
+            trim_ascii(value);
+            snprintf(current_name, sizeof(current_name), "%s", value);
+            current_protocol_ok = false;
+            current_has_addr = false;
+            current_has_cmd = false;
+            current_addr = 0;
+            current_cmd = 0;
+            continue;
+        }
+
+        if(strncmp(line, "protocol:", 9) == 0) {
+            char* value = line + 9;
+            trim_ascii(value);
+            current_protocol_ok = (strcmp(value, "NECext") == 0);
+            continue;
+        }
+
+        if(strncmp(line, "address:", 8) == 0) {
+            char* value = line + 8;
+            trim_ascii(value);
+            current_has_addr = parse_ir_bytes_u16(value, &current_addr);
+            continue;
+        }
+
+        if(strncmp(line, "command:", 8) == 0) {
+            char* value = line + 8;
+            trim_ascii(value);
+            current_has_cmd = parse_ir_bytes_u16(value, &current_cmd);
+            continue;
+        }
+    }
+
+    maybe_store_ir_entry(
+        app,
+        current_name,
+        current_protocol_ok,
+        current_has_addr,
+        current_has_cmd,
+        current_addr,
+        current_cmd);
+    free(text);
+
+    app->ir_file_ready =
+        app->ir_code_power.valid && app->ir_code_fan_speed.valid && app->ir_code_fan_cycle.valid;
+    if(app->ir_file_ready) {
+        FURI_LOG_I(
+            TAG,
+            "IR file loaded %s P:%04X/%04X S:%04X/%04X C:%04X/%04X",
+            IR_FILE_PATH,
+            app->ir_code_power.address,
+            app->ir_code_power.command,
+            app->ir_code_fan_speed.address,
+            app->ir_code_fan_speed.command,
+            app->ir_code_fan_cycle.address,
+            app->ir_code_fan_cycle.command);
+    } else {
+        FURI_LOG_W(
+            TAG,
+            "IR file incomplete; using constants power=%d speed=%d cycle=%d",
+            (int)app->ir_code_power.valid,
+            (int)app->ir_code_fan_speed.valid,
+            (int)app->ir_code_fan_cycle.valid);
+    }
+}
+
+static void app_apply_ir_settings(OneSixteenthSleepApp* app) {
+    InfraredTxSettings settings = {0};
+    const bool loaded = saved_struct_load(
+        INFRARED_SETTINGS_PATH,
+        &settings,
+        sizeof(settings),
+        INFRARED_SETTINGS_MAGIC,
+        INFRARED_SETTINGS_VERSION);
+
+    if(!loaded) {
+        FURI_LOG_W(TAG, "IR settings missing; using default tx pin");
+    }
+
+    app->ir_otg_enabled = false;
+
+    if(settings.tx_pin < FuriHalInfraredTxPinMax) {
+        app->ir_tx_pin = settings.tx_pin;
+        furi_hal_infrared_set_tx_output(app->ir_tx_pin);
+
+        if(app->ir_tx_pin != FuriHalInfraredTxPinInternal && settings.otg_enabled) {
+            app->ir_otg_enabled = furi_hal_power_enable_otg();
+        }
+    } else {
+        app->ir_tx_pin = furi_hal_infrared_detect_tx_output();
+        furi_hal_infrared_set_tx_output(app->ir_tx_pin);
+        if(app->ir_tx_pin != FuriHalInfraredTxPinInternal) {
+            app->ir_otg_enabled = furi_hal_power_enable_otg();
+        }
+    }
+
+    FURI_LOG_I(
+        TAG,
+        "IR tx pin=%lu otg=%d",
+        (unsigned long)app->ir_tx_pin,
+        (int)app->ir_otg_enabled);
+}
+
+static void app_resolve_ir_code(
+    OneSixteenthSleepApp* app,
+    IrAction action,
+    uint16_t fallback_command,
+    uint16_t* out_address,
+    uint16_t* out_command,
+    bool* out_from_file) {
+    uint16_t address = IR_B10_ADDR;
+    uint16_t command = fallback_command;
+    bool from_file = false;
+
+    if(app->ir_file_ready) {
+        const IrFileCode* code = NULL;
+        if(action == IrActionPower) code = &app->ir_code_power;
+        else if(action == IrActionFanSpeed) code = &app->ir_code_fan_speed;
+        else if(action == IrActionFanCycle) code = &app->ir_code_fan_cycle;
+
+        if(code && code->valid) {
+            address = code->address;
+            command = code->command;
+            from_file = true;
+        }
+    }
+
+    if(out_address) *out_address = address;
+    if(out_command) *out_command = command;
+    if(out_from_file) *out_from_file = from_file;
+}
+
+static void app_ir_tx_start_resolved(
+    OneSixteenthSleepApp* app,
+    uint16_t address,
+    uint16_t command,
+    bool from_file,
+    const char* label) {
+    if(app->ir_tx_active || !app->ir_worker) return;
+
+    furi_hal_infrared_set_tx_output(app->ir_tx_pin);
     InfraredMessage msg = {
         .protocol = InfraredProtocolNECext,
-        .address = IR_B10_ADDR,
+        .address = address,
         .command = command,
         .repeat = false,
     };
+    infrared_worker_set_decoded_signal(app->ir_worker, &msg);
+    infrared_worker_tx_set_get_signal_callback(
+        app->ir_worker, infrared_worker_tx_get_signal_steady_callback, app);
+    infrared_worker_tx_start(app->ir_worker);
+    app->ir_tx_active = true;
+    app->manual_ir_started_ms = now_ms();
 
-    infrared_send(&msg, 4);
-    FURI_LOG_I(TAG, "IR send %s A:%04lX C:%04lX", label, (unsigned long)IR_B10_ADDR, (unsigned long)command);
+    FURI_LOG_I(
+        TAG,
+        "IR tx start %s src=%s A:%04lX C:%04lX",
+        label,
+        from_file ? "file" : "const",
+        (unsigned long)address,
+        (unsigned long)command);
+
     app_set_last_ir(app, label);
 }
 
+static void app_ir_tx_stop(OneSixteenthSleepApp* app) {
+    if(!app->ir_tx_active || !app->ir_worker) return;
+    infrared_worker_tx_stop(app->ir_worker);
+    infrared_worker_tx_set_get_signal_callback(app->ir_worker, NULL, NULL);
+    app->ir_tx_active = false;
+    FURI_LOG_I(TAG, "IR tx stop");
+}
+
+static void app_send_ir(
+    OneSixteenthSleepApp* app,
+    IrAction action,
+    uint16_t fallback_command,
+    const char* label) {
+    uint16_t address = IR_B10_ADDR;
+    uint16_t command = fallback_command;
+    bool from_file = false;
+    app_resolve_ir_code(app, action, fallback_command, &address, &command, &from_file);
+
+    app_ir_tx_start_resolved(app, address, command, from_file, label);
+    furi_delay_ms(IR_HOLD_SEND_MS);
+    app_ir_tx_stop(app);
+}
+
+static void app_manual_ir_start(
+    OneSixteenthSleepApp* app,
+    IrAction action,
+    uint16_t fallback_command,
+    const char* label) {
+    if(app->manual_ir_action != IrActionNone || app->ir_tx_active) return;
+
+    uint16_t address = IR_B10_ADDR;
+    uint16_t command = fallback_command;
+    bool from_file = false;
+    app_resolve_ir_code(app, action, fallback_command, &address, &command, &from_file);
+    app_ir_tx_start_resolved(app, address, command, from_file, label);
+    app->manual_ir_action = action;
+}
+
+static void app_manual_ir_stop(OneSixteenthSleepApp* app) {
+    if(app->ir_tx_active) {
+        const uint32_t elapsed = now_ms() - app->manual_ir_started_ms;
+        if(elapsed < IR_HOLD_SEND_MS) {
+            furi_delay_ms(IR_HOLD_SEND_MS - elapsed);
+        }
+    }
+    app_ir_tx_stop(app);
+    app->manual_ir_action = IrActionNone;
+}
+
 static void app_power_toggle(OneSixteenthSleepApp* app) {
-    app_send_ir(app, IR_B10_POWER_CMD, "POWER");
+    app_send_ir(app, IrActionPower, IR_B10_POWER_CMD, "POWER");
     app->power_on = !app->power_on;
 }
 
 static void app_fan_speed_step(OneSixteenthSleepApp* app) {
-    app_send_ir(app, IR_B10_FAN_SPEED_CMD, "SPD_STEP");
+    app_send_ir(app, IrActionFanSpeed, IR_B10_FAN_SPEED_CMD, "SPD_STEP");
     app->fan_speed = next_level(app->fan_speed);
 }
 
 static void app_fan_cycle_step(OneSixteenthSleepApp* app) {
-    app_send_ir(app, IR_B10_FAN_CYCLE_CMD, "CYC_STEP");
+    app_send_ir(app, IrActionFanCycle, IR_B10_FAN_CYCLE_CMD, "CYC_STEP");
     app->fan_cycle = next_level(app->fan_cycle);
 }
 
@@ -386,19 +750,27 @@ static void draw_callback(Canvas* canvas, void* context) {
 }
 
 static void handle_input_event(OneSixteenthSleepApp* app, const InputEvent* input) {
-    // Support explicit Short/Long events from CLI input injection.
     if(input->type == InputTypeShort) {
+        // Fallback path for injected "short" events (CLI automation).
         if(input->key == InputKeyOk) {
             FURI_LOG_I(TAG, "Input short OK");
             app_power_toggle(app);
             return;
         }
         if(input->key == InputKeyLeft) {
+            if(app->suppress_left_short_action) {
+                app->suppress_left_short_action = false;
+                return;
+            }
             FURI_LOG_I(TAG, "Input short LEFT");
             app_fan_speed_step(app);
             return;
         }
         if(input->key == InputKeyRight) {
+            if(app->suppress_right_short_action) {
+                app->suppress_right_short_action = false;
+                return;
+            }
             FURI_LOG_I(TAG, "Input short RIGHT");
             app_fan_cycle_step(app);
             return;
@@ -420,6 +792,10 @@ static void handle_input_event(OneSixteenthSleepApp* app, const InputEvent* inpu
     }
 
     if(input->type == InputTypeLong && input->key == InputKeyOk) {
+        if(app->manual_ir_action == IrActionPower) {
+            // Keep long-hold behavior for IR POWER send; don't repurpose this hold.
+            return;
+        }
         FURI_LOG_I(TAG, "Input long OK");
         app->auto_mode = !app->auto_mode;
         app_set_last_ir(app, app->auto_mode ? "AUTO_ON" : "AUTO_OFF");
@@ -427,45 +803,36 @@ static void handle_input_event(OneSixteenthSleepApp* app, const InputEvent* inpu
         return;
     }
 
-    // Handle real key press/release paths used in viewport apps.
     if(input->type == InputTypePress) {
-        switch(input->key) {
-        case InputKeyBack:
+        if(input->key == InputKeyLeft) {
+            FURI_LOG_I(TAG, "Input press LEFT -> TX start");
+            app_manual_ir_start(app, IrActionFanSpeed, IR_B10_FAN_SPEED_CMD, "SPD_STEP");
+            return;
+        }
+        if(input->key == InputKeyRight) {
+            FURI_LOG_I(TAG, "Input press RIGHT -> TX start");
+            app_manual_ir_start(app, IrActionFanCycle, IR_B10_FAN_CYCLE_CMD, "CYC_STEP");
+            return;
+        }
+        if(input->key == InputKeyBack) {
             app->running = false;
-            return;
-        case InputKeyLeft:
-            FURI_LOG_I(TAG, "Input press LEFT");
-            app_fan_speed_step(app);
-            return;
-        case InputKeyRight:
-            FURI_LOG_I(TAG, "Input press RIGHT");
-            app_fan_cycle_step(app);
-            return;
-        case InputKeyUp:
-            app->target_c = clamp_target(app->target_c + 0.5f);
-            app_set_last_ir(app, "TARGET+");
-            return;
-        case InputKeyDown:
-            app->target_c = clamp_target(app->target_c - 0.5f);
-            app_set_last_ir(app, "TARGET-");
-            return;
-        case InputKeyOk:
-            FURI_LOG_I(TAG, "Input press OK");
-            app->ok_pressed = true;
-            app->ok_long_sent = false;
-            app->ok_pressed_ms = now_ms();
-            return;
-        default:
             return;
         }
     }
 
-    if(input->type == InputTypeRelease && input->key == InputKeyOk) {
-        if(app->ok_pressed && !app->ok_long_sent) {
-            app_power_toggle(app);
+    if(input->type == InputTypeRelease) {
+        if(input->key == InputKeyLeft && app->manual_ir_action == IrActionFanSpeed) {
+            app_manual_ir_stop(app);
+            app->fan_speed = next_level(app->fan_speed);
+            app->suppress_left_short_action = true;
+            return;
         }
-        app->ok_pressed = false;
-        app->ok_long_sent = false;
+        if(input->key == InputKeyRight && app->manual_ir_action == IrActionFanCycle) {
+            app_manual_ir_stop(app);
+            app->fan_cycle = next_level(app->fan_cycle);
+            app->suppress_right_short_action = true;
+            return;
+        }
     }
 }
 
@@ -483,7 +850,15 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
 
     app->one_wire = NULL;
     app->sensor_pin_index = -1;
-    furi_hal_infrared_set_tx_output(FuriHalInfraredTxPinInternal);
+    app_apply_ir_settings(app);
+    app->ir_worker = infrared_worker_alloc();
+    app->ir_tx_active = false;
+    app->manual_ir_started_ms = 0;
+    app->manual_ir_action = IrActionNone;
+    app->suppress_ok_release_action = false;
+    app->suppress_left_short_action = false;
+    app->suppress_right_short_action = false;
+    app->ir_file_ready = false;
 
     app->power_on = true;
     app->fan_speed = 1;
@@ -493,6 +868,7 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
     app->last_auto_action_ms = now_ms();
     app->running = true;
     snprintf(app->last_ir, sizeof(app->last_ir), "BOOT");
+    app_load_ir_file_signals(app);
 
     view_port_draw_callback_set(app->view_port, draw_callback, app);
     view_port_input_callback_set(app->view_port, input_callback, app);
@@ -510,14 +886,6 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
         }
 
         if(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk) {
-            if(app->ok_pressed && !app->ok_long_sent &&
-               (now_ms() - app->ok_pressed_ms >= OK_LONG_PRESS_MS)) {
-                app->auto_mode = !app->auto_mode;
-                app_set_last_ir(app, app->auto_mode ? "AUTO_ON" : "AUTO_OFF");
-                app->last_auto_action_ms = 0;
-                app->ok_long_sent = true;
-            }
-
             sensor_service(app);
             auto_control_tick(app);
             furi_mutex_release(app->mutex);
@@ -530,6 +898,12 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
     view_port_free(app->view_port);
 
     sensor_detach(app);
+    app_manual_ir_stop(app);
+    if(app->ir_worker) infrared_worker_free(app->ir_worker);
+    if(app->ir_otg_enabled) {
+        furi_hal_power_disable_otg();
+        app->ir_otg_enabled = false;
+    }
 
     furi_message_queue_free(app->event_queue);
     furi_mutex_free(app->mutex);

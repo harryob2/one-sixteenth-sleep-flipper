@@ -12,8 +12,9 @@ Flipper-native controller for Adamson B10 with DS18B20 temperature feedback.
   - modeled power / fan speed / fan cycle
   - last action
 - Sends Adamson B10 IR commands using Flipper IR transmitter (`NECext`, `A:0x4C4D`).
-- Forces IR TX output to Flipper internal emitter for consistency.
+- Uses Flipper IR TX settings (`.infrared.settings`) so TX path matches stock IR behavior.
 - Supports automatic control to cool toward your target temperature.
+- Holds manual IR fan commands long enough for units that require a sustained press.
 
 ## Controls
 - `OK` short: Power toggle
@@ -103,3 +104,4 @@ python tools/generate_ui_previews.py
 ## Known Limits
 - State is modeled in-app; if a separate remote is used manually, modeled state can drift.
 - v1 reads one DS18B20 sensor at a time (auto-detected pin).
+- IR verification through third-party receivers can be hardware-sensitive; validate against the target unit behavior first.
