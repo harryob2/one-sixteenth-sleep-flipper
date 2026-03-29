@@ -25,6 +25,7 @@
 #define SENSOR_DISCOVERY_INTERVAL_MS 3000
 #define SENSOR_CONVERSION_WAIT_MS 800
 #define AUTO_ACTION_GAP_MS 15000
+#define OK_LONG_PRESS_MS 700
 
 #define IR_B10_ADDR 0x4C4D
 #define IR_B10_POWER_CMD 0x47B8
@@ -36,12 +37,29 @@ typedef struct {
 } OneSixteenthSleepEvent;
 
 typedef struct {
+    const GpioPin* pin;
+    const char* name;
+} SensorPinOption;
+
+static const SensorPinOption SENSOR_PINS[] = {
+    {.pin = &gpio_ext_pc3, .name = "PC3"},
+    {.pin = &gpio_ext_pa7, .name = "PA7"},
+    {.pin = &gpio_ext_pc1, .name = "PC1"},
+    {.pin = &gpio_ext_pc0, .name = "PC0"},
+    {.pin = &gpio_ext_pb2, .name = "PB2"},
+    {.pin = &gpio_ext_pb3, .name = "PB3"},
+    {.pin = &gpio_ext_pa4, .name = "PA4"},
+    {.pin = &gpio_ext_pa6, .name = "PA6"},
+};
+
+typedef struct {
     Gui* gui;
     ViewPort* view_port;
     FuriMessageQueue* event_queue;
     FuriMutex* mutex;
 
     OneWireHost* one_wire;
+    int8_t sensor_pin_index;
     bool sensor_found;
     uint8_t sensor_rom[8];
     bool conversion_in_progress;
@@ -60,6 +78,10 @@ typedef struct {
     bool auto_mode;
     float target_c;
     uint32_t last_auto_action_ms;
+
+    bool ok_pressed;
+    bool ok_long_sent;
+    uint32_t ok_pressed_ms;
 
     bool running;
 } OneSixteenthSleepApp;
@@ -97,6 +119,8 @@ static void app_set_last_ir(OneSixteenthSleepApp* app, const char* label) {
 }
 
 static void app_send_ir(OneSixteenthSleepApp* app, uint16_t command, const char* label) {
+    furi_hal_infrared_set_tx_output(FuriHalInfraredTxPinInternal);
+
     InfraredMessage msg = {
         .protocol = InfraredProtocolNECext,
         .address = IR_B10_ADDR,
@@ -104,8 +128,8 @@ static void app_send_ir(OneSixteenthSleepApp* app, uint16_t command, const char*
         .repeat = false,
     };
 
-    infrared_send(&msg, 3);
-
+    infrared_send(&msg, 4);
+    FURI_LOG_I(TAG, "IR send %s A:%04lX C:%04lX", label, (unsigned long)IR_B10_ADDR, (unsigned long)command);
     app_set_last_ir(app, label);
 }
 
@@ -140,6 +164,18 @@ static void app_set_cycle_level(OneSixteenthSleepApp* app, uint8_t target) {
     }
 }
 
+static void sensor_detach(OneSixteenthSleepApp* app) {
+    if(app->one_wire) {
+        onewire_host_stop(app->one_wire);
+        onewire_host_free(app->one_wire);
+        app->one_wire = NULL;
+    }
+    app->sensor_found = false;
+    app->sensor_pin_index = -1;
+    app->conversion_in_progress = false;
+    app->temp_valid = false;
+}
+
 static bool sensor_find_ds18b20(OneSixteenthSleepApp* app) {
     uint8_t rom[8] = {0};
 
@@ -158,10 +194,34 @@ static bool sensor_find_ds18b20(OneSixteenthSleepApp* app) {
     return true;
 }
 
-static bool sensor_start_conversion(OneSixteenthSleepApp* app) {
-    if(!onewire_host_reset(app->one_wire)) {
-        return false;
+static bool sensor_attach_any_pin(OneSixteenthSleepApp* app) {
+    sensor_detach(app);
+
+    for(size_t i = 0; i < COUNT_OF(SENSOR_PINS); i++) {
+        OneWireHost* host = onewire_host_alloc(SENSOR_PINS[i].pin);
+        if(!host) continue;
+        onewire_host_start(host);
+
+        app->one_wire = host;
+        if(sensor_find_ds18b20(app)) {
+            app->sensor_found = true;
+            app->sensor_pin_index = (int8_t)i;
+            FURI_LOG_I(TAG, "Sensor found on %s", SENSOR_PINS[i].name);
+            return true;
+        }
+
+        onewire_host_stop(host);
+        onewire_host_free(host);
+        app->one_wire = NULL;
     }
+
+    FURI_LOG_I(TAG, "Sensor not found on scanned GPIO pins");
+    return false;
+}
+
+static bool sensor_start_conversion(OneSixteenthSleepApp* app) {
+    if(!app->one_wire) return false;
+    if(!onewire_host_reset(app->one_wire)) return false;
 
     onewire_host_write(app->one_wire, SENSOR_CMD_MATCH_ROM);
     onewire_host_write_bytes(app->one_wire, app->sensor_rom, 8);
@@ -172,9 +232,8 @@ static bool sensor_start_conversion(OneSixteenthSleepApp* app) {
 static bool sensor_read_celsius(OneSixteenthSleepApp* app, float* out_temp_c) {
     uint8_t scratch[9] = {0};
 
-    if(!onewire_host_reset(app->one_wire)) {
-        return false;
-    }
+    if(!app->one_wire) return false;
+    if(!onewire_host_reset(app->one_wire)) return false;
 
     onewire_host_write(app->one_wire, SENSOR_CMD_MATCH_ROM);
     onewire_host_write_bytes(app->one_wire, app->sensor_rom, 8);
@@ -193,24 +252,18 @@ static bool sensor_read_celsius(OneSixteenthSleepApp* app, float* out_temp_c) {
 static void sensor_service(OneSixteenthSleepApp* app) {
     const uint32_t now = now_ms();
 
-    if(!app->sensor_found) {
-        if(now - app->last_sensor_probe_ms < SENSOR_DISCOVERY_INTERVAL_MS) {
-            return;
-        }
+    if(!app->sensor_found || !app->one_wire) {
+        if(now - app->last_sensor_probe_ms < SENSOR_DISCOVERY_INTERVAL_MS) return;
 
         app->last_sensor_probe_ms = now;
-        app->sensor_found = sensor_find_ds18b20(app);
+        app->sensor_found = sensor_attach_any_pin(app);
         app->temp_valid = false;
         app->conversion_in_progress = false;
 
-        if(app->sensor_found) {
-            if(sensor_start_conversion(app)) {
-                app->conversion_in_progress = true;
-                app->conversion_started_ms = now;
-                app_set_last_ir(app, "SENSOR_OK");
-            } else {
-                app->sensor_found = false;
-            }
+        if(app->sensor_found && sensor_start_conversion(app)) {
+            app->conversion_in_progress = true;
+            app->conversion_started_ms = now;
+            app_set_last_ir(app, "SENSOR_OK");
         }
         return;
     }
@@ -220,23 +273,19 @@ static void sensor_service(OneSixteenthSleepApp* app) {
             app->conversion_in_progress = true;
             app->conversion_started_ms = now;
         } else {
-            app->sensor_found = false;
-            app->temp_valid = false;
+            sensor_detach(app);
         }
         return;
     }
 
-    if(now - app->conversion_started_ms < SENSOR_CONVERSION_WAIT_MS) {
-        return;
-    }
+    if(now - app->conversion_started_ms < SENSOR_CONVERSION_WAIT_MS) return;
 
     float temp_c = 0.0f;
     if(sensor_read_celsius(app, &temp_c)) {
         app->temp_c = temp_c;
         app->temp_valid = true;
     } else {
-        app->sensor_found = false;
-        app->temp_valid = false;
+        sensor_detach(app);
     }
 
     app->conversion_in_progress = false;
@@ -294,9 +343,7 @@ static void draw_callback(Canvas* canvas, void* context) {
     furi_assert(context);
     OneSixteenthSleepApp* app = context;
 
-    if(furi_mutex_acquire(app->mutex, 25) != FuriStatusOk) {
-        return;
-    }
+    if(furi_mutex_acquire(app->mutex, 25) != FuriStatusOk) return;
 
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
@@ -311,7 +358,8 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
     canvas_draw_str(canvas, 2, 19, line);
 
-    snprintf(line, sizeof(line), "Sensor: %s (PA7)", app->sensor_found ? "OK" : "NO");
+    const char* pin_name = (app->sensor_pin_index >= 0) ? SENSOR_PINS[app->sensor_pin_index].name : "--";
+    snprintf(line, sizeof(line), "Sensor: %s (%s)", app->sensor_found ? "OK" : "NO", pin_name);
     canvas_draw_str(canvas, 2, 29, line);
 
     snprintf(
@@ -338,22 +386,59 @@ static void draw_callback(Canvas* canvas, void* context) {
 }
 
 static void handle_input_event(OneSixteenthSleepApp* app, const InputEvent* input) {
-    if(input->type != InputTypeShort && input->type != InputTypeLong) {
+    // Support explicit Short/Long events from CLI input injection.
+    if(input->type == InputTypeShort) {
+        if(input->key == InputKeyOk) {
+            FURI_LOG_I(TAG, "Input short OK");
+            app_power_toggle(app);
+            return;
+        }
+        if(input->key == InputKeyLeft) {
+            FURI_LOG_I(TAG, "Input short LEFT");
+            app_fan_speed_step(app);
+            return;
+        }
+        if(input->key == InputKeyRight) {
+            FURI_LOG_I(TAG, "Input short RIGHT");
+            app_fan_cycle_step(app);
+            return;
+        }
+        if(input->key == InputKeyUp) {
+            app->target_c = clamp_target(app->target_c + 0.5f);
+            app_set_last_ir(app, "TARGET+");
+            return;
+        }
+        if(input->key == InputKeyDown) {
+            app->target_c = clamp_target(app->target_c - 0.5f);
+            app_set_last_ir(app, "TARGET-");
+            return;
+        }
+        if(input->key == InputKeyBack) {
+            app->running = false;
+            return;
+        }
+    }
+
+    if(input->type == InputTypeLong && input->key == InputKeyOk) {
+        FURI_LOG_I(TAG, "Input long OK");
+        app->auto_mode = !app->auto_mode;
+        app_set_last_ir(app, app->auto_mode ? "AUTO_ON" : "AUTO_OFF");
+        app->last_auto_action_ms = 0;
         return;
     }
 
-    if(input->type == InputTypeShort) {
+    // Handle real key press/release paths used in viewport apps.
+    if(input->type == InputTypePress) {
         switch(input->key) {
         case InputKeyBack:
             app->running = false;
             return;
-        case InputKeyOk:
-            app_power_toggle(app);
-            return;
         case InputKeyLeft:
+            FURI_LOG_I(TAG, "Input press LEFT");
             app_fan_speed_step(app);
             return;
         case InputKeyRight:
+            FURI_LOG_I(TAG, "Input press RIGHT");
             app_fan_cycle_step(app);
             return;
         case InputKeyUp:
@@ -364,15 +449,23 @@ static void handle_input_event(OneSixteenthSleepApp* app, const InputEvent* inpu
             app->target_c = clamp_target(app->target_c - 0.5f);
             app_set_last_ir(app, "TARGET-");
             return;
+        case InputKeyOk:
+            FURI_LOG_I(TAG, "Input press OK");
+            app->ok_pressed = true;
+            app->ok_long_sent = false;
+            app->ok_pressed_ms = now_ms();
+            return;
         default:
             return;
         }
     }
 
-    if(input->type == InputTypeLong && input->key == InputKeyOk) {
-        app->auto_mode = !app->auto_mode;
-        app_set_last_ir(app, app->auto_mode ? "AUTO_ON" : "AUTO_OFF");
-        app->last_auto_action_ms = 0;
+    if(input->type == InputTypeRelease && input->key == InputKeyOk) {
+        if(app->ok_pressed && !app->ok_long_sent) {
+            app_power_toggle(app);
+        }
+        app->ok_pressed = false;
+        app->ok_long_sent = false;
     }
 }
 
@@ -380,9 +473,7 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
     UNUSED(p);
 
     OneSixteenthSleepApp* app = malloc(sizeof(OneSixteenthSleepApp));
-    if(!app) {
-        return 255;
-    }
+    if(!app) return 255;
     memset(app, 0, sizeof(OneSixteenthSleepApp));
 
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -390,10 +481,9 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
     app->view_port = view_port_alloc();
     app->gui = furi_record_open(RECORD_GUI);
 
-    app->one_wire = onewire_host_alloc(&gpio_ext_pa7);
-    if(app->one_wire) {
-        onewire_host_start(app->one_wire);
-    }
+    app->one_wire = NULL;
+    app->sensor_pin_index = -1;
+    furi_hal_infrared_set_tx_output(FuriHalInfraredTxPinInternal);
 
     app->power_on = true;
     app->fan_speed = 1;
@@ -420,9 +510,15 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
         }
 
         if(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk) {
-            if(app->one_wire) {
-                sensor_service(app);
+            if(app->ok_pressed && !app->ok_long_sent &&
+               (now_ms() - app->ok_pressed_ms >= OK_LONG_PRESS_MS)) {
+                app->auto_mode = !app->auto_mode;
+                app_set_last_ir(app, app->auto_mode ? "AUTO_ON" : "AUTO_OFF");
+                app->last_auto_action_ms = 0;
+                app->ok_long_sent = true;
             }
+
+            sensor_service(app);
             auto_control_tick(app);
             furi_mutex_release(app->mutex);
         }
@@ -433,10 +529,7 @@ int32_t one_sixteenth_sleep_flipper_app(void* p) {
     gui_remove_view_port(app->gui, app->view_port);
     view_port_free(app->view_port);
 
-    if(app->one_wire) {
-        onewire_host_stop(app->one_wire);
-        onewire_host_free(app->one_wire);
-    }
+    sensor_detach(app);
 
     furi_message_queue_free(app->event_queue);
     furi_mutex_free(app->mutex);

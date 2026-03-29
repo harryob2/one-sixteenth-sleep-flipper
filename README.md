@@ -3,7 +3,7 @@
 Flipper-native controller for Adamson B10 with DS18B20 temperature feedback.
 
 ## What This App Does
-- Reads DS18B20 water temperature from GPIO `PA7`.
+- Reads DS18B20 water temperature by auto-scanning supported GPIO pins.
 - Shows a live on-device dashboard:
   - current temperature
   - sensor status
@@ -12,6 +12,7 @@ Flipper-native controller for Adamson B10 with DS18B20 temperature feedback.
   - modeled power / fan speed / fan cycle
   - last action
 - Sends Adamson B10 IR commands using Flipper IR transmitter (`NECext`, `A:0x4C4D`).
+- Forces IR TX output to Flipper internal emitter for consistency.
 - Supports automatic control to cool toward your target temperature.
 
 ## Controls
@@ -33,10 +34,11 @@ Flipper-native controller for Adamson B10 with DS18B20 temperature feedback.
 - Auto actions are rate-limited to avoid command spam.
 
 ## Wiring (DS18B20)
-Default data pin in app is `PA7`.
+The app auto-scans these data pins:
+- `PC3`, `PA7`, `PC1`, `PC0`, `PB2`, `PB3`, `PA4`, `PA6`
 
 Connect:
-- DS18B20 `DATA` -> Flipper GPIO `PA7`
+- DS18B20 `DATA` -> one supported pin above (`PC3` recommended)
 - DS18B20 `VCC` -> Flipper `3.3V`
 - DS18B20 `GND` -> Flipper `GND`
 
@@ -100,4 +102,4 @@ python tools/generate_ui_previews.py
 
 ## Known Limits
 - State is modeled in-app; if a separate remote is used manually, modeled state can drift.
-- v1 reads one DS18B20 sensor on fixed pin `PA7`.
+- v1 reads one DS18B20 sensor at a time (auto-detected pin).
