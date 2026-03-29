@@ -1,0 +1,14 @@
+App(
+    appid="one_sixteenth_sleep_flipper",
+    name="One Sixteenth Sleep",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="one_sixteenth_sleep_flipper_app",
+    stack_size=4 * 1024,
+    fap_category="GPIO",
+    fap_version="0.1",
+    fap_icon="one_sixteenth_sleep_flipper.png",
+    fap_description="DS18B20 water temp + Adamson B10 IR control",
+    fap_author="Harry O'Brien",
+    fap_weburl="https://github.com/harryob2/one-sixteenth-sleep-flipper",
+    fap_icon_assets="images",
+)

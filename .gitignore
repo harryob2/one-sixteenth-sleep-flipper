@@ -1,0 +1,9 @@
+dist/*
+!dist/one_sixteenth_sleep_flipper.fap
+.venv/
+.vscode
+.clang-format
+.clangd
+.editorconfig
+.env
+.ufbt
